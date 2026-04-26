@@ -39,7 +39,8 @@
       funcProto = Function.prototype,
       objectProto = Object.prototype,
       numberProto = Number.prototype,
-      stringProto = String.prototype;
+      stringProto = String.prototype,
+      booleanProto = Boolean.prototype;
 
   /** Method and object shortcuts. */
   var phantom = root.phantom,
@@ -16573,6 +16574,24 @@
         assert.deepEqual(object, { 'a': { 'b': 2 } });
       });
     });
+
+    // Prevent regression for
+    // https://github.com/lodash/lodash/security/advisories/GHSA-xxjr-mmjv-4gpg
+    // https://github.com/lodash/lodash/security/advisories/GHSA-7p9j-vj7v-w7j7
+    QUnit.test('Security: _.omit should not allow modifying prototype or constructor properties', function(assert) {
+      assert.expect(3);
+
+      var testObj1 = {};
+      assert.strictEqual(typeof testObj1.toString, 'function', 'Object.toString should work before omit');
+
+      _.omit({}, ['__proto__.toString']);
+      _.omit({}, ['constructor.prototype.toString']);
+      _.omit({}, [['constructor'], ['prototype'], ['toString']]);
+
+      var testObj2 = {};
+      assert.strictEqual(typeof testObj2.toString, 'function', 'Object.toString should still work after omit');
+      assert.strictEqual(objectProto.toString.call({}), '[object Object]', 'Object.toString should behave as expected');
+    });
   }());
 
   /*--------------------------------------------------------------------------*/
@@ -22674,6 +22693,52 @@
 
       assert.deepEqual(actual, ['one', '&quot;two&quot;', 'three']);
     });
+
+    // Related to https://github.com/lodash/lodash/security/advisories/GHSA-xj2r-5m88-79m3
+    QUnit.test('should not execute code via malicious imports key names', function(assert) {
+      assert.expect(2);
+
+      // Default-parameter injection via imports key
+      var executed = false;
+      var key = 'a = (global.templateTest1 = true, 1)';
+      var imports = {};
+      imports[key] = undefined;
+
+      try { _.template('hello', { 'imports': imports }); } catch (e) {}
+      executed = global.templateTest1 === true;
+      delete global.templateTest1;
+
+      assert.strictEqual(executed, false, 'should not execute default-parameter expression in imports key');
+
+      // Same without spaces
+      var executed2 = false;
+      var key2 = 'a=(global.templateTest2=true,1)';
+      var imports2 = {};
+      imports2[key2] = undefined;
+
+      try { _.template('hello', { 'imports': imports2 }); } catch (e) {}
+      executed2 = global.templateTest2 === true;
+      delete global.templateTest2;
+
+      assert.strictEqual(executed2, false, 'should not execute compact default-parameter expression in imports key');
+    });
+
+    // Related to https://github.com/lodash/lodash/security/advisories/GHSA-xj2r-5m88-79m3
+    QUnit.test('should not enumerate inherited keys from imports sources', function(assert) {
+      assert.expect(1);
+
+      // Simulate prototype pollution: inherited key with code injection
+      var executed = false;
+      var payload = 'a = (global.templateTest3 = true, 1)';
+      var polluted = Object.create({ [payload]: undefined });
+      polluted._ = _;
+
+      try { _.template('hello', { 'imports': polluted }); } catch (e) {}
+      executed = global.templateTest3 === true;
+      delete global.templateTest3;
+
+      assert.strictEqual(executed, false, 'should not execute code from inherited imports keys');
+    });
   }());
 
   /*--------------------------------------------------------------------------*/
@@ -25194,7 +25259,7 @@
       assert.deepEqual(actual, expected);
     });
 
-    QUnit.test('should follow `path` over non-plain objects', function(assert) {
+    QUnit.test('should block constructor.prototype paths from primitives but follow regular non-plain paths', function(assert) {
       assert.expect(8);
 
       var object = { 'a': '' },
@@ -25204,8 +25269,8 @@
         numberProto.a = 1;
 
         var actual = _.unset(0, path);
-        assert.strictEqual(actual, true);
-        assert.notOk('a' in numberProto);
+        assert.strictEqual(actual, false);
+        assert.ok('a' in numberProto);
 
         delete numberProto.a;
       });
@@ -25238,6 +25303,99 @@
       else {
         skipAssert(assert);
       }
+    });
+
+    // Prevent regression for:
+    // https://github.com/lodash/lodash/security/advisories/GHSA-xxjr-mmjv-4gpg
+    // https://github.com/lodash/lodash/security/advisories/GHSA-f23m-r3pf-42rh
+    QUnit.test('Security: _.unset should not allow modifying prototype or constructor properties', function(assert) {
+      assert.expect(6);
+
+      var testStr1 = 'ABC';
+      assert.strictEqual(typeof testStr1.toLowerCase, 'function', 'String.toLowerCase should exist before unset');
+
+      _.unset({ foo: 'bar' }, 'foo.__proto__.toLowerCase');
+      _.unset({ foo: 'bar' }, 'foo.constructor.prototype.toLowerCase');
+      _.unset({ foo: 'bar' }, [['foo'], ['__proto__'], ['toLowerCase']]);
+      _.unset({ foo: 'bar' }, [['foo'], ['constructor'], ['prototype'], ['toLowerCase']]);
+      _.unset({ foo: 'bar' }, ['foo', ['__proto__'], 'toLowerCase']);
+
+      var testStr2 = 'ABC';
+      assert.strictEqual(typeof testStr2.toLowerCase, 'function', 'String.toLowerCase should still exist after unset');
+      assert.strictEqual(testStr2.toLowerCase(), 'abc', 'String.toLowerCase should work as expected');
+
+      objectProto.foo = 'bar';
+      _.unset({}, [['__proto__'], ['foo']]);
+      assert.strictEqual(objectProto.foo, 'bar', '__proto__ access via array-wrapped segments should be blocked');
+      delete objectProto.foo;
+
+      assert.strictEqual(typeof funcProto.apply, 'function', 'Function.prototype.apply should exist before unset');
+
+      _.unset(0, 'constructor.prototype.toString.constructor.prototype.apply');
+      _.unset(0, ['constructor', 'prototype', 'toString', 'constructor', 'prototype', 'apply']);
+
+      assert.strictEqual(typeof funcProto.apply, 'function', 'Function.prototype.apply should not be deletable via deep constructor.prototype chain');
+    });
+
+    QUnit.test('Security: _.unset should not allow deleting static methods from constructors', function(assert) {
+      assert.expect(8);
+
+      assert.strictEqual(typeof Object.keys, 'function', 'Object.keys should exist before unset');
+
+      _.unset({}, ['constructor', 'keys']);
+      _.unset({}, 'constructor.keys');
+      _.unset({}, [['constructor'], ['keys']]);
+
+      assert.strictEqual(typeof Object.keys, 'function', 'Object.keys should not be deletable via constructor traversal');
+
+      assert.strictEqual(typeof Array.isArray, 'function', 'Array.isArray should exist before unset');
+
+      _.unset([], [ 'constructor', 'isArray']);
+
+      assert.strictEqual(typeof Array.isArray, 'function', 'Array.isArray should not be deletable via constructor traversal');
+
+      assert.strictEqual(typeof String.fromCharCode, 'function', 'String.fromCharCode should exist before unset');
+
+      _.unset('', [ 'constructor', 'fromCharCode']);
+      _.unset({ foo: 'bar' }, [ 'foo', 'constructor', 'fromCharCode']);
+
+      assert.strictEqual(typeof String.fromCharCode, 'function', 'String.fromCharCode should not be deletable via constructor traversal');
+
+      assert.strictEqual(typeof Number.isFinite, 'function', 'Number.isFinite should exist before unset');
+
+      _.unset(0, ['constructor', 'isFinite']);
+      _.unset(0, 'constructor.isFinite');
+
+      assert.strictEqual(typeof Number.isFinite, 'function', 'Number.isFinite should not be deletable via primitive constructor traversal');
+    });
+
+    // Prevent regression for:
+    // https://github.com/lodash/lodash/security/advisories/GHSA-w36w-cm3g-pc62
+    QUnit.test('Security: _.unset should protect built-in prototype methods on primitive types', function(assert) {
+      assert.expect(11);
+
+      // Number.prototype built-ins
+      assert.strictEqual(typeof numberProto.toFixed, 'function', 'Number.prototype.toFixed should exist before unset');
+
+      assert.strictEqual(_.unset(0, 'constructor.prototype.toFixed'), false, 'should return false for built-in Number.prototype.toFixed');
+      assert.strictEqual(_.unset(0, ['constructor', 'prototype', 'toFixed']), false, 'should return false for built-in Number.prototype.toFixed (array path)');
+      assert.strictEqual(_.unset(0, ['constructor', ['prototype'], 'toFixed']), false, 'should return false for built-in Number.prototype.toFixed (array path)');
+
+      assert.strictEqual(typeof numberProto.toFixed, 'function', 'Number.prototype.toFixed should still exist after unset attempts');
+
+      // String.prototype built-ins
+      assert.strictEqual(typeof stringProto.toLowerCase, 'function', 'String.prototype.toLowerCase should exist before unset');
+
+      assert.strictEqual(_.unset('', 'constructor.prototype.toLowerCase'), false, 'should return false for built-in String.prototype.toLowerCase');
+
+      assert.strictEqual(typeof stringProto.toLowerCase, 'function', 'String.prototype.toLowerCase should still exist after unset attempts');
+
+      // Boolean.prototype built-ins
+      assert.strictEqual(typeof booleanProto.valueOf, 'function', 'Boolean.prototype.valueOf should exist before unset');
+
+      assert.strictEqual(_.unset(true, 'constructor.prototype.valueOf'), false, 'should return false for built-in Boolean.prototype.valueOf');
+
+      assert.strictEqual(typeof booleanProto.valueOf, 'function', 'Boolean.prototype.valueOf should still exist after unset attempts');
     });
   }());
 
